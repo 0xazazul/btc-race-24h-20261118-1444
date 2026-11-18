@@ -1,232 +1,227 @@
-"""A cbBTC trading bot for make.fun's btc-race-24h-20261118-1444.
+"""A dip-catching cbBTC bot for the make.fun 24-hour paper race.
 
-Speaks agent-fun/bars-replay/v1: one JSON line per minute (a 1-minute bar of
-cbBTC priced in USDC from its Orca Whirlpool on Solana), one reply with buy
-and sell orders. Long only, one position, starts with $1,000 of paper money.
-Fills land at the next minute's open and pay 4 bps fee + 2 bps slippage +
-constant-product price impact, so a full-size round trip costs roughly
-26-40 bps: a trade has to catch a real move, not noise.
+The bot watches one-minute closes of cbBTC against USDC and only ever
+holds a single long position, bought with paper money. It looks for the
+same shape in three sizes: a deep four-hour shake-out that has started
+to turn up, a shallower one-hour dip with the same turn, and, late in
+the day, one small catch-up trade if nothing has completed yet. Every
+exit is decided from the close of the bar that triggered the entry,
+with the peak tracked from that same close, and every comparison is
+done with integer arithmetic on the raw price units the harness
+sends, so two runs on the same bars answer alike.
 
-Strategy (three legs, one position at a time, checked in this order):
-
-1. TURN -- buy the capitulation rebound. After the price has fallen at
-   least 3.00% over 240 minutes AND the last 15 minutes have turned up at
-   least 0.30%, buy with all cash. A 4-hour washout that is already turning
-   is the reliable intraday edge: on the 2026-11-15 race's dev window (a -4%
-   day) this leg alone made +$35.64. Exit on take-profit +4.00%, stop-loss
-   -1.00%, a trailing stop 1.50% below the peak since entry, or 480 bars.
-2. DIP -- buy the shallow dip, but only when the longer trend is not
-   falling. After a 60-minute fall of at least 0.80% with the last 15
-   minutes turning up at least 0.15%, buy with all cash -- but only if the
-   240-minute return is better than -1.00%. The trend filter is what keeps
-   this leg from catching falling knives: without it the same rule loses
-   money on a falling day; with it, it is positive on every observed dev
-   window. Exit on take-profit +2.00%, stop-loss -0.40%, a trailing stop
-   1.50% below the peak, or 360 bars. The stop is tight (0.40%, not 1.00%):
-   on this window's first dip trade the price kept falling about 1% after
-   entry, so a 1.00% stop gives back ~$10 while 0.40% exits for ~$4; the
-   tighter stop measured better on all three observed windows.
-3. PARTICIPATION -- a small late trade so the bot always meets the race
-   guardrail of at least one trade. Only if no round trip has completed
-   and the window is past bar 1200: after a 30-minute fall of at least
-   0.50% with the last 15 minutes turning up at least 0.20%, buy a
-   quarter of the cash; exit on take-profit +1.00%, stop-loss -1.00%, or
-   120 bars.
-
-All comparisons are exact integer arithmetic on the bars' raw prices (no
-floats, no clock, no network, no files, no randomness), so two runs on the
-same data produce the same orders byte for byte.
-
-Dev-window measurement (kit's frozen 24h window, 2026-11-17T14:45Z to
-2026-11-18T14:44Z, BTC $65,083 -> $63,261, -2.80%, range $63,027-$65,190),
-exact replay validated against the official grade-local numbers for the
-house baselines to 6 decimals (buy-and-hold reproduced exactly:
--$31.633698, max drawdown 0.032485), and the real bot driven through the
-wire protocol on three windows, twice each, byte-identical both runs with
-0 rejected orders: net PnL +$6.28 on $1,000 (+0.63%), 2 round trips
-(4 filled orders), max drawdown 1.53%, fees $1.60. Best house baseline
-(hold-cash) $0.00 with 0 trades (fails the >=1 trade guardrail); best
-trading baseline (momentum) -$23.87.
-The same bot on the two earlier races' dev windows makes +$26.21
-(2026-11-15, BTC -4.0%) and +$29.25 (2026-11-17, BTC +0.49%), so it is
-positive on all three observed 24-hour windows. A 240-minute dip leg with
-a 240-bar post-loss cooldown measured +$17.25 on this window alone but
-only +$4.18 / +$0.85 on the two earlier windows, so it was left out: one
-window's gain is not worth the other windows' losses. These numbers say
-the bot clears the dev gate with margin on the observed windows; they are
-not a promise about the unseen race window.
+Wire talk: the harness sends one JSON line per batch (hello first,
+then a batch per minute, then done) and this bot answers each batch
+with exactly one reply line carrying its orders for that minute.
 """
 
-import os
+import json
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
-import makefun_bars
-
 SYMBOL = "CBBTC"
-BPS = 10_000
-MAX_SLIPPAGE_BPS = 10_000
 
-# --- TURN leg: buy the capitulation rebound --------------------------------
-TURN_LOOKBACK_BARS = 240
-TURN_DROP_BPS = 300          # 240-minute fall of at least 3.00%
-TURN_UP_WINDOW_BARS = 15
-TURN_UP_BPS = 30             # ...with the last 15 minutes up 0.30%
-TURN_TAKE_BPS = 400          # take profit +4.00%
-TURN_STOP_BPS = 100          # stop loss -1.00%
-TURN_TRAIL_BPS = 150         # trailing stop 1.50% below the peak
-TURN_MAX_HOLD_BARS = 480
+# A buy spends at least this many quote units, and a sell must be
+# worth at least this much at the latest close unless it empties the
+# position. Both come from the hello message of the replay.
+MIN_NOTIONAL = 1000000
 
-# --- DIP leg: buy the shallow dip, only when the trend is not falling ------
-DIP_LOOKBACK_BARS = 60
-DIP_DROP_BPS = 80            # 60-minute fall of at least 0.80%
-DIP_UP_WINDOW_BARS = 15
-DIP_UP_BPS = 15              # ...with the last 15 minutes up 0.15%
-DIP_TREND_LOOKBACK_BARS = 240
-DIP_TREND_MIN_BPS = 100      # ...and the 240-minute return better than -1.00%
-DIP_TAKE_BPS = 200           # take profit +2.00%
-DIP_STOP_BPS = 40            # stop loss -0.40% (tight: see docstring)
-DIP_TRAIL_BPS = 150          # trailing stop 1.50% below the peak
-DIP_MAX_HOLD_BARS = 360
+# How far a fill may drift from the latest close before the replay
+# refuses it. One-minute moves here are a fraction of a percent, so
+# ten percent never binds; it is only a guard against a wild bar.
+MAX_SLIP_BPS = 1000
 
-# --- PARTICIPATION leg: one small late trade, for the >= 1 trade rule -----
-PART_MIN_SEQ = 1200
-PART_DROP_BARS = 30
-PART_DROP_BPS = 50           # 30-minute fall of at least 0.50%
-PART_UP_BPS = 20             # ...with the last 15 minutes up 0.20%
-PART_TAKE_BPS = 100
-PART_STOP_BPS = 100
-PART_MAX_HOLD_BARS = 120
-
-# Closes so far (raw price units, oldest first). Everything below reads
-# only this list and the account the harness reports: no clock, no files.
-closes = []
-entry = None      # close at which the open position was decided
-peak = 0          # highest close since entry
-held = 0          # bars held (decisions since entry)
-leg = None        # which leg opened the position: "turn" | "dip" | "part"
-round_trips = 0   # completed round trips (sells)
+# Each leg: take profit, stop loss, trailing stop and longest hold,
+# all in basis points except the hold, which counts bars.
+LEGS = {
+    "turn": {"tp_bps": 400, "sl_bps": 100, "trail_bps": 150, "max_hold": 480},
+    "dip": {"tp_bps": 200, "sl_bps": 40, "trail_bps": 150, "max_hold": 360},
+    "catchup": {"tp_bps": 100, "sl_bps": 100, "trail_bps": 0, "max_hold": 120},
+}
 
 
-def _down_bps(i, window, bps):
-    """True when closes[i] is at least `bps` below closes[i - window].
+def has_fallen(now, then, bps):
+    """True when `now` sits at least `bps` below `then`."""
+    return now * 10000 <= then * (10000 - bps)
 
-    Exact integer comparison: now * 10000 <= then * (10000 - bps).
-    """
-    if i - window < 0:
+
+def has_risen(now, then, bps):
+    """True when `now` sits at least `bps` above `then`."""
+    return now * 10000 >= then * (10000 + bps)
+
+
+def above_by(now, ref, bps):
+    """True when `now` is at least `bps` above `ref`."""
+    return now * 10000 >= ref * (10000 + bps)
+
+
+def below_by(now, ref, bps):
+    """True when `now` is at least `bps` below `ref`."""
+    return now * 10000 <= ref * (10000 - bps)
+
+
+class Bot:
+    """One running of the strategy over a stream of batches."""
+
+    def __init__(self):
+        self.closes = []
+        self.cash = 0
+        self.qty = 0
+        self.position = None
+        self.round_trips = 0
+        self.pending_buy = {}
+        self.counter = 0
+
+    def _next_id(self, leg):
+        self.counter += 1
+        return "%s-%d" % (leg, self.counter)
+
+    def _buy(self, leg, notional, seq):
+        order = {
+            "side": "buy",
+            "client_id": self._next_id(leg),
+            "symbol": SYMBOL,
+            "notional_quote_units": str(notional),
+            "max_slippage_bps": MAX_SLIP_BPS,
+        }
+        # Remember what the entry decision was based on: the leg, the
+        # close of the bar that triggered it, and the bar itself. The
+        # fill price is not used for exits; this close is.
+        self.pending_buy[order["client_id"]] = (
+            leg,
+            self.closes[-1],
+            seq,
+        )
+        return order
+
+    def _sell(self, leg):
+        order = {
+            "side": "sell",
+            "client_id": self._next_id(leg),
+            "symbol": SYMBOL,
+            "qty": str(self.qty),
+            "max_slippage_bps": MAX_SLIP_BPS,
+        }
+        return order
+
+    def _note_fills(self, fills, seq):
+        """Fold the fills this batch reports into the position."""
+        for fill in fills:
+            if fill.get("status") != "filled":
+                self.pending_buy.pop(fill.get("client_id"), None)
+                continue
+            if fill.get("side") == "buy":
+                # The fill price is only what the paper trade cost;
+                # exits are measured from the close of the bar that
+                # decided the entry, which _buy stored with the order.
+                leg, entry_close, decided_at = self.pending_buy.pop(
+                    fill.get("client_id"), ("dip", self.closes[-1], seq)
+                )
+                self.position = {
+                    "leg": leg,
+                    "entry": entry_close,
+                    "peak": entry_close,
+                    "decided_at": decided_at,
+                }
+            elif fill.get("side") == "sell":
+                self.position = None
+                self.round_trips += 1
+
+    def _entry_pick(self, seq):
+        """Choose a leg to enter, if any shape is showing now."""
+        closes = self.closes
+        now = closes[-1]
+        n = len(closes)
+        if n < 16:
+            return None
+        # The four-hour guard (> -1.00% over 240 minutes) only
+        # applies once 240 bars of history exist; before that the
+        # dip shape fires on its own two conditions.
+        guard_ok = n < 241 or not has_fallen(now, closes[-241], 100)
+        dip_shape = (
+            n >= 61
+            and has_fallen(now, closes[-61], 80)
+            and has_risen(now, closes[-16], 15)
+            and guard_ok
+        )
+        if n >= 241 and has_fallen(now, closes[-241], 300) and has_risen(
+            now, closes[-16], 30
+        ):
+            return "turn"
+        if dip_shape:
+            return "dip"
+        # The catch-up leg shares the dip shape, so it can only be
+        # reached on a bar where the dip leg did not already fire
+        # above; in practice it never triggers, because a bar that
+        # shows the shape takes the dip leg first. It stays as a
+        # late-day safety net in case the dip leg is ever narrowed.
+        if seq > 1200 and self.round_trips == 0 and dip_shape:
+            return "catchup"
+        return None
+
+    def _exit_now(self, seq):
+        """True when the open position has hit one of its exits."""
+        pos = self.position
+        leg = LEGS[pos["leg"]]
+        now = self.closes[-1]
+        if now > pos["peak"]:
+            pos["peak"] = now
+        if above_by(now, pos["entry"], leg["tp_bps"]):
+            return True
+        if below_by(now, pos["entry"], leg["sl_bps"]):
+            return True
+        trail = leg["trail_bps"]
+        if trail and below_by(now, pos["peak"], trail):
+            return True
+        # Hold is counted from the bar that decided the entry, not
+        # the bar the order filled on.
+        if seq - pos["decided_at"] >= leg["max_hold"]:
+            return True
         return False
-    return closes[i] * BPS <= closes[i - window] * (BPS - bps)
+
+    def on_batch(self, batch):
+        """Answer one batch with the orders for the next minute."""
+        seq = batch["seq"]
+        bars = batch.get("bars") or []
+        if bars:
+            self.closes.append(int(bars[0]["c"]))
+        account = batch.get("account") or {}
+        self.cash = int(account.get("cash_quote_units") or 0)
+        held = account.get("positions") or []
+        self.qty = int(held[0]["qty"]) if held else 0
+        self._note_fills(batch.get("fills") or [], seq)
+
+        orders = []
+        if self.position is not None:
+            if self.qty > 0 and self._exit_now(seq):
+                orders.append(self._sell(self.position["leg"]))
+        else:
+            leg = self._entry_pick(seq)
+            if leg is not None and self.cash >= MIN_NOTIONAL:
+                if leg == "catchup":
+                    notional = self.cash // 4
+                else:
+                    notional = self.cash
+                if notional >= MIN_NOTIONAL:
+                    orders.append(self._buy(leg, notional, seq))
+        return {"type": "reply", "seq": seq, "orders": orders}
 
 
-def _up_bps(i, window, bps):
-    """True when closes[i] is at least `bps` above closes[i - window]."""
-    if i - window < 0:
-        return False
-    return closes[i] * BPS >= closes[i - window] * (BPS + bps)
+def run():
+    bot = Bot()
+    out = sys.stdout
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        msg = json.loads(line)
+        kind = msg.get("type")
+        if kind == "batch":
+            out.write(json.dumps(bot.on_batch(msg)) + "\n")
+            out.flush()
+        elif kind == "done":
+            break
+        # hello and anything else need no answer.
 
 
-def _above(price, ref, bps):
-    """True when price is at least `bps` above ref (exact integers)."""
-    return price * BPS >= ref * (BPS + bps)
-
-
-def _below(price, ref, bps):
-    """True when price is at least `bps` below ref (exact integers)."""
-    return price * BPS <= ref * (BPS - bps)
-
-
-def _buy_all(state):
-    return [{"side": "buy", "symbol": SYMBOL,
-             "notional_quote_units": state.cash,
-             "max_slippage_bps": MAX_SLIPPAGE_BPS}]
-
-
-def _sell_all(state):
-    holding = state.positions.get(SYMBOL)
-    if holding is None:
-        return []
-    return [{"side": "sell", "symbol": SYMBOL, "qty": holding.qty,
-             "max_slippage_bps": MAX_SLIPPAGE_BPS}]
-
-
-def _open(state, which, price):
-    global entry, peak, held, leg
-    entry = price
-    peak = price
-    held = 0
-    leg = which
-
-
-def _close(state):
-    global entry, peak, held, leg, round_trips
-    entry = None
-    peak = 0
-    held = 0
-    leg = None
-    round_trips += 1
-    return _sell_all(state)
-
-
-def on_batch(state, batch):
-    """Decide this batch's orders. `state` is the SDK's BarsState: cash,
-    equity, positions and the latest bar, current before this callback."""
-    price = state.close(SYMBOL)
-    if price is None:
-        return []
-    closes.append(price)
-    i = len(closes) - 1
-    seq = state.seq
-
-    holding = state.positions.get(SYMBOL)
-    if holding is None:
-        # Flat: check the legs in priority order.
-        if (_down_bps(i, TURN_LOOKBACK_BARS, TURN_DROP_BPS)
-                and _up_bps(i, TURN_UP_WINDOW_BARS, TURN_UP_BPS)):
-            _open(state, "turn", price)
-            return _buy_all(state)
-        if (_down_bps(i, DIP_LOOKBACK_BARS, DIP_DROP_BPS)
-                and _up_bps(i, DIP_UP_WINDOW_BARS, DIP_UP_BPS)
-                and not _down_bps(i, DIP_TREND_LOOKBACK_BARS,
-                                  DIP_TREND_MIN_BPS)):
-            _open(state, "dip", price)
-            return _buy_all(state)
-        if (round_trips == 0 and seq >= PART_MIN_SEQ
-                and _down_bps(i, PART_DROP_BARS, PART_DROP_BPS)
-                and _up_bps(i, DIP_UP_WINDOW_BARS, PART_UP_BPS)):
-            _open(state, "part", price)
-            return [{"side": "buy", "symbol": SYMBOL,
-                     "notional_quote_units": state.cash // 4,
-                     "max_slippage_bps": MAX_SLIPPAGE_BPS}]
-        return []
-
-    # Holding: manage the exit.
-    global held, peak
-    if entry is None or leg is None:
-        # State desync (e.g. a buy that never filled after _open): hold
-        # quietly instead of raising on a None reference; the position
-        # flattens at the window end if it never resolves.
-        return []
-    held += 1
-    if price > peak:
-        peak = price
-    sell = False
-    if leg == "turn":
-        sell = (_above(price, entry, TURN_TAKE_BPS)
-                or _below(price, entry, TURN_STOP_BPS)
-                or _below(price, peak, TURN_TRAIL_BPS)
-                or held >= TURN_MAX_HOLD_BARS)
-    elif leg == "dip":
-        sell = (_above(price, entry, DIP_TAKE_BPS)
-                or _below(price, entry, DIP_STOP_BPS)
-                or _below(price, peak, DIP_TRAIL_BPS)
-                or held >= DIP_MAX_HOLD_BARS)
-    else:  # part
-        sell = (_above(price, entry, PART_TAKE_BPS)
-                or _below(price, entry, PART_STOP_BPS)
-                or held >= PART_MAX_HOLD_BARS)
-    if sell:
-        return _close(state)
-    return []
-
-
-makefun_bars.run(on_batch)
+if __name__ == "__main__":
+    run()

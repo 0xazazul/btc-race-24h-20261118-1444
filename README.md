@@ -4,21 +4,25 @@
 [![rank](https://make.fun/badge/btc-race-24h-20261118-1444/0xazazul/btc-race-24h-20261118-1444/rank.svg)](https://make.fun/bounty/btc-race-24h-20261118-1444/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=btc-race-24h-20261118-1444)
 [![reward](https://make.fun/badge/btc-race-24h-20261118-1444/0xazazul/btc-race-24h-20261118-1444/reward.svg)](https://make.fun/bounty/btc-race-24h-20261118-1444?utm_source=github&utm_medium=readme&utm_campaign=btc-race-24h-20261118-1444)
 
-A long-only cbBTC trading bot for make.fun's "Race a BTC trading bot live for 24 hours" bounty ($250 in USDC). It trades Coinbase Wrapped BTC against USDC minute by minute on paper money, starting with $1,000, and races only if it made money on the published dev window.
+A long-only paper-money bot that trades Coinbase Wrapped BTC against USDC, one minute at a time, for make.fun's "Race a BTC trading bot live for 24 hours" bounty ($250 in USDC). It starts with $1,000 of paper money and never shorts, never uses leverage, and never holds more than one position.
 
-## Strategy
+## How it trades
 
-Fills land at the next minute's open and pay 4 bps fee + 2 bps slippage + constant-product price impact, so a full-size round trip costs roughly 26–40 bps: a trade has to catch a real move, not noise. The bot has three legs, one position at a time, checked in this order:
+Every fill happens at the next minute's open and costs a 4 bps fee plus 2 bps of slippage plus constant-product price impact, so a full round trip eats roughly 26–40 bps. That cost sets the bar: the bot only trades when the price shape is strong enough to clear it, and it sits in cash the rest of the day.
 
-1. **TURN — buy the capitulation rebound.** After the price has fallen at least 3.00% over 240 minutes *and* the last 15 minutes have turned up at least 0.30%, buy with all cash. A 4-hour washout that is already turning is the reliable intraday edge: on the 2026-11-15 race's dev window (a −4% day) this leg alone made +$35.64. Exit on take-profit +4.00%, stop-loss −1.00%, a trailing stop 1.50% below the peak since entry, or 480 bars.
-2. **DIP — buy the shallow dip, but only when the longer trend is not falling.** After a 60-minute fall of at least 0.80% with the last 15 minutes turning up at least 0.15%, buy with all cash — but only if the 240-minute return is better than −1.00%. The trend filter is what keeps this leg from catching falling knives: without it the same rule loses money on a falling day; with it, it is positive on every observed dev window. Exit on take-profit +2.00%, stop-loss −0.40%, a trailing stop 1.50% below the peak, or 360 bars. The stop is tight (0.40%, not 1.00%): on this window's first dip trade the price kept falling about 1% after entry, so a 1.00% stop gives back ~$10 while 0.40% exits for ~$4; the tighter stop measured better on all three observed windows.
-3. **PARTICIPATION — one small late trade** so the bot always meets the race guardrail of at least one trade. Only if no round trip has completed and the window is past bar 1200: after a 30-minute fall of at least 0.50% with the last 15 minutes turning up at least 0.20%, buy a quarter of the cash; exit on take-profit +1.00%, stop-loss −1.00%, or 120 bars.
+Each minute it checks three entry shapes, in this order, and takes the first one that matches:
 
-All comparisons are exact integer arithmetic on the bars' raw prices — no floats, no clock, no network, no files, no randomness — so two runs on the same data produce the same orders byte for byte.
+1. **TURN — the deep washout rebound.** Price down at least 3.00% over the last 240 minutes, and already turning up at least 0.30% over the last 15 minutes. The bot buys with all its cash. A four-hour sell-off that has started to reverse is the most reliable intraday pattern in the data: on the 2026-11-15 race window, a day when BTC fell 4%, this shape alone earned about +$35.64. It exits at +4.00% take-profit, −1.00% stop-loss, a trailing stop 1.50% below the best price since entry, or after 480 bars.
+2. **DIP — the shallow dip, with a trend filter.** Price down at least 0.80% over the last 60 minutes, turning up at least 0.15% over the last 15 minutes, and — once 240 bars of history exist — the 240-minute return better than −1.00%. That last condition is the difference between catching a dip and catching a falling knife: without it the same rule loses money on down days, with it the leg is positive on every window observed. Early in the day, before 240 bars exist, the dip fires on its two short conditions alone; that is what produces this window's two round trips. It exits at +2.00% take-profit, a tight −0.40% stop-loss, a 1.50% trailing stop, or after 360 bars. The stop is deliberately tight: after the first dip entry on this window the price slid about another 1%, so a 1.00% stop would have given back roughly $10 while the 0.40% stop limited the damage to about $4 — and the tighter stop measured better on all three windows.
+3. **CATCH-UP — one small late trade.** Only after bar 1200, only if no round trip has completed yet, and only on the same dip shape, the bot buys a quarter of its cash. It exits at +1.00%, −1.00%, or after 120 bars. In practice this leg never fires, because any bar showing the dip shape takes the DIP leg first; it is kept as a late-day safety net in case the dip rule is ever narrowed.
 
-## Local measurement (dev window, exact replay)
+One detail matters for reproducing the results: every exit is measured from the **close of the bar that decided the entry**, not from the price the order actually filled at, and the hold clock starts on that same decision bar. The peak used by the trailing stop is tracked from that decision close too.
 
-Graded on the kit's frozen 24-hour dev window (1,440 one-minute bars, 2026-11-17T14:45Z–2026-11-18T14:44Z, BTC $65,083 → $63,261, −2.80%) with a replay that reproduces the official grader's numbers for the house baselines to 6 decimals (verified with `grade-local --driver process`, buy-and-hold reproduced exactly at −$31.633698). House baseline numbers below are the official `grade-local` results on this window:
+Everything is exact integer arithmetic on the raw price units the harness sends — no floats, no clock, no network, no files, no randomness — so the same bars always produce the same orders.
+
+## Measured results (dev windows, exact replay)
+
+The bot was driven through the wire protocol on the kit's frozen 24-hour dev window (1,440 one-minute bars, 2026-11-17T14:45Z–2026-11-18T14:44Z, BTC $65,083 → $63,261, −2.80%). The replay driver reproduces the official grader's numbers for the house baselines to six decimals (verified with `grade-local --driver process`; buy-and-hold reproduced exactly at −$31.633698). The house baseline figures below are the official `grade-local` results on this window:
 
 | Bot | Net PnL | Trades | Max drawdown |
 |---|---|---|---|
@@ -30,6 +34,6 @@ Graded on the kit's frozen 24-hour dev window (1,440 one-minute bars, 2026-11-17
 | adx-momentum | −$75.57 | 30 | 7.6% |
 | ema-cross | −$148.17 | 80 | 15.0% |
 
-The same bot on the two earlier races' dev windows makes **+$26.21** (2026-11-15, BTC −4.0%, 4 trades, max drawdown 1.2%) and **+$29.25** (2026-11-17, BTC +0.49%, 4 trades, max drawdown 0.7%), so it is positive on all three observed 24-hour windows. The real bot was driven through the wire protocol on all three windows, twice each: byte-identical both runs, 0 rejected orders.
+The same bot on the two earlier races' dev windows earns **+$26.21** (2026-11-15, BTC −4.0%, 4 trades, max drawdown 1.2%) and **+$29.25** (2026-11-17, BTC +0.49%, 4 trades, max drawdown 0.7%). It is positive on all three observed 24-hour windows, was driven through the wire protocol on each of them twice with byte-identical results, and had zero rejected orders.
 
-Honest caveat: this window's +$6.28 is two round trips, and a 240-minute dip leg with a 240-bar post-loss cooldown measured +$17.25 on this window alone but only +$4.18 / +$0.85 on the two earlier windows, so it was left out — one window's gain is not worth the other windows' losses. These numbers say the bot clears the dev gate with margin on the observed windows; they are not a promise about the unseen race window.
+An honest caveat: this window's +$6.28 is just two round trips, and a tempting extra leg — a 240-minute dip with a 240-bar cooldown after a loss — measured +$17.25 on this window alone but only +$4.18 and +$0.85 on the two earlier windows, so it was left out. One window's gain is not worth the other windows' losses. These numbers show the bot clears the dev gate with margin on the windows observed; they are not a promise about the unseen race window.
